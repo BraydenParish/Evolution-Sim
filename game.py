@@ -4,6 +4,7 @@ import sys
 import requests
 import threading
 import math
+from collections import deque
 
 # ==========================================
 # CONFIGURATION
@@ -12,8 +13,9 @@ MODEL_NAME = "qwen2.5:1.5b"
 TILE_SIZE = 36
 MAP_W, MAP_H = 18, 18
 SIDEBAR_W = 360
+LOG_HEIGHT = 140
 SCREEN_W = (MAP_W * TILE_SIZE) + SIDEBAR_W
-SCREEN_H = MAP_H * TILE_SIZE
+SCREEN_H = (MAP_H * TILE_SIZE) + LOG_HEIGHT
 FPS = 15
 
 # Color Palette
@@ -64,6 +66,7 @@ class Human:
         self.name = f"{'Sun' if tribe_id==0 else 'Moon'}_{id}"
         self.x, self.y = x, y
         self.hp, self.hunger = 100, 0
+        self.thirst = 0
         self.inventory, self.tools = [], []
         self.alive = True
         self.thought = "I seek food and the light."
@@ -71,21 +74,7 @@ class Human:
         self.is_thinking = False
         self.anim_timer = random.random() * 10
         self.attack_power = 10
-        self.spear_uses = 0
-
-    def use_spear(self):
-        """Decrement spear durability and convert to a stick when exhausted."""
-        if "SPEAR" not in self.tools:
-            return
-        if not hasattr(self, "spear_uses"):
-            self.spear_uses = 5
-        self.spear_uses -= 1
-        if self.spear_uses <= 0:
-            self.spear_uses = 0
-            if "SPEAR" in self.tools:
-                self.tools.remove("SPEAR")
-            self.inventory.append("🥢")
-            self.attack_power = 10
+        self.move_cooldown = 0.0
 
     def trigger_thinking(self, situation):
         if self.is_thinking: return
@@ -153,36 +142,164 @@ def draw_world_tile(surf, x, y, t_type):
 # MAIN SIMULATION CLASS
 # ==========================================
 class Simulation:
-    def __init__(self):
-        self.world = [[random.choices([0,1,2,3], weights=[60,15,10,15])[0] for _ in range(MAP_W)] for _ in range(MAP_H)]
+    def __init__(self, rng=None):
+        self.rng = rng or random.Random()
+        self.world = [[self.rng.choices([0,1,2,3], weights=[60,15,10,15])[0] for _ in range(MAP_W)] for _ in range(MAP_H)]
         self.items = {}
+        self.apple_regrowth = {}
         for y in range(MAP_H):
             for x in range(MAP_W):
-                if self.world[y][x] == 1: self.items[(x,y)] = "🍎"
-                elif self.world[y][x] == 2: self.items[(x,y)] = "🦴" 
-                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢"
+                if self.world[y][x] == 1:
+                    self.items[(x,y)] = "🍎"
+                elif self.world[y][x] == 2:
+                    self.items[(x,y)] = "🦴"
+                elif self.world[y][x] == 3:
+                    self.items[(x,y)] = "🥢"
 
-        self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0) for i in range(3)] + \
-                      [Human(i, random.randint(15,17), random.randint(15,17), 1) for i in range(3,6)]
+        self.humans = [Human(i, self.rng.randint(0,2), self.rng.randint(0,2), 0) for i in range(3)] + \
+                      [Human(i, self.rng.randint(15,17), self.rng.randint(15,17), 1) for i in range(3,6)]
         self.selected = self.humans[0]
 
-    @staticmethod
-    def _apple_capacity(human):
-        return 5 if "Vine Basket" in human.inventory else 1
+        self.fires = {(2, 2), (15, 15)}
+        self.log_events = deque(maxlen=8)
+        self.first_spear_logged = False
 
-    def _near_fire(self, x, y):
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                pos = (x + dx, y + dy)
-                if pos in self.items and self.items[pos] == "🔥":
-                    return True
+        self.time_minutes = 8 * 60
+        self.total_minutes = 0.0
+        self.day_count = 0
+        self.light_level = 1.0
+        self.is_night = False
+        self.is_raining = False
+        self.temperature = 20
+        self.log_event("The world begins at dawn.")
+
+    def log_event(self, text):
+        stamp_hour = int(self.time_minutes // 60) % 24
+        stamp_min = int(self.time_minutes % 60)
+        self.log_events.appendleft(f"D{self.day_count+1:02d} {stamp_hour:02d}:{stamp_min:02d} - {text}")
+
+    def _compute_light_level(self):
+        hour = (self.time_minutes / 60) % 24
+        if 6 <= hour < 18:
+            self.is_night = False
+            if 6 <= hour < 8:
+                return 0.3 + ((hour-6)/2)*0.7
+            elif 16 <= hour < 18:
+                return 1.0 - ((hour-16)/2)*0.7
+            return 1.0
+        self.is_night = True
+        if 18 <= hour < 20:
+            return 0.3 + ((20-hour)/2)*0.7
+        elif 4 <= hour < 6:
+            return 0.3 + ((hour-4)/2)*0.7
+        return 0.3
+
+    def _roll_weather(self):
+        was_raining = self.is_raining
+        self.is_raining = self.rng.random() < 0.1
+        if self.is_raining:
+            if self.fires:
+                self.fires.clear()
+                self.log_event("Rain douses every fire.")
+            self.log_event("Rain clouds gather over the camp.")
+        elif was_raining:
+            self.log_event("The rain stops; embers fade.")
+
+    def _update_apple_regrowth(self, dt_minutes):
+        to_restore = []
+        for pos in list(self.apple_regrowth.keys()):
+            self.apple_regrowth[pos] += dt_minutes
+            if self.apple_regrowth[pos] >= 3 * 24 * 60:
+                to_restore.append(pos)
+
+        for pos in to_restore:
+            self.apple_regrowth.pop(pos, None)
+            self.items[pos] = "🍎"
+            self.log_event("An apple tree bears fruit again.")
+
+    def _advance_time(self, dt_seconds):
+        dt_minutes = dt_seconds * 1  # 1 real second = 1 in-game minute
+        self.total_minutes += dt_minutes
+        self.time_minutes += dt_minutes
+        while self.time_minutes >= 24 * 60:
+            self.time_minutes -= 24 * 60
+            self.day_count += 1
+            self._roll_weather()
+        for y in range(MAP_H):
+            for x in range(MAP_W):
+                pos = (x, y)
+                if self.world[y][x] == 1 and pos not in self.items and pos not in self.apple_regrowth:
+                    self.apple_regrowth[pos] = 0
+        self.light_level = self._compute_light_level()
+        self.temperature = 26 if not self.is_night else 10
+        if self.is_raining:
+            self.temperature -= 3
+        self._update_apple_regrowth(dt_minutes)
+
+    def _is_sheltered(self, h):
+        return self.world[h.y][h.x] == 1
+
+    def _near_fire(self, h):
+        for fx, fy in self.fires:
+            if abs(fx - h.x) <= 2 and abs(fy - h.y) <= 2:
+                return True
         return False
 
-    def update(self):
+    def _vision_range(self, h):
+        if self._near_fire(h):
+            return 4
+        return 4 if not self.is_night else 2
+
+    def _find_nearest_tile(self, h, tile_type, max_dist):
+        best = None
+        for dy in range(-max_dist, max_dist+1):
+            for dx in range(-max_dist, max_dist+1):
+                tx, ty = h.x + dx, h.y + dy
+                if 0 <= tx < MAP_W and 0 <= ty < MAP_H:
+                    if abs(dx) + abs(dy) > max_dist:
+                        continue
+                    if self.world[ty][tx] == tile_type:
+                        if best is None or abs(dx) + abs(dy) < abs(best[0]-h.x) + abs(best[1]-h.y):
+                            best = (tx, ty)
+        return best
+
+    def _find_nearest_item(self, h, item, max_dist):
+        best = None
+        for (ix, iy), itm in self.items.items():
+            if itm != item:
+                continue
+            dist = abs(ix - h.x) + abs(iy - h.y)
+            if dist <= max_dist:
+                if best is None or dist < abs(best[0]-h.x) + abs(best[1]-h.y):
+                    best = (ix, iy)
+        return best
+
+    def _step_toward(self, h, target, purposeful=False):
+        tx, ty = target
+        dx = 0 if tx == h.x else (1 if tx > h.x else -1)
+        dy = 0 if ty == h.y else (1 if ty > h.y else -1)
+        nx, ny = h.x + dx, h.y + dy
+        if 0 <= nx < MAP_W and 0 <= ny < MAP_H:
+            if self.world[ny][nx] == 3 and not purposeful:
+                return
+            h.x, h.y = nx, ny
+            if self.world[ny][nx] == 3:
+                h.move_cooldown = max(h.move_cooldown, 0.75)
+
+    def update(self, dt_seconds=1.0):
+        self._advance_time(dt_seconds)
         for h in self.humans:
             if not h.alive: continue
-            h.hunger += 0.05
-            if h.hunger > 100: h.hp -= 0.5
+            if h.move_cooldown > 0:
+                h.move_cooldown = max(0.0, h.move_cooldown - dt_seconds)
+
+            energy_factor = 1.3 if self.is_raining else 1.0
+            h.hunger += 0.75 * dt_seconds * energy_factor
+            h.thirst += 0.6 * dt_seconds * energy_factor
+            if h.hunger > 100: h.hp -= 0.5 * dt_seconds
+            if h.thirst > 100: h.hp -= 0.6 * dt_seconds
+            if self.is_night and not (self._near_fire(h) or self._is_sheltered(h)):
+                h.hp -= 0.25 * dt_seconds
             if h.hp <= 0: h.alive = False
 
             # Discovery of fire while contemplating.
@@ -199,13 +316,8 @@ class Simulation:
             item = self.items.get((h.x, h.y))
             if item:
                 if item == "🍎":
-                    if h.inventory.count("🍎") < self._apple_capacity(h):
-                        h.inventory.append(item)
                     h.hunger = 0
-                    self.items.pop((h.x, h.y))
-                elif item == "🔥":
-                    # Leave fire in place; do not pick up.
-                    pass
+                    self.apple_regrowth[(h.x, h.y)] = 0
                 else:
                     h.inventory.append(item)
                     h.trigger_thinking(f"I picked up a {item}.")
@@ -226,6 +338,9 @@ class Simulation:
                         other.hp -= 5
                         h.trigger_thinking("I hurled a stone at a foe!")
 
+            if self.world[h.y][h.x] == 3 and h.thirst > 0:
+                h.thirst = 0
+
             # Trigger Crafting Check
             if "🦴" in h.inventory and "🥢" in h.inventory and "SPEAR" not in h.tools:
                 h.trigger_thinking("I have a stick and a stone. Can I make something?")
@@ -238,10 +353,39 @@ class Simulation:
                         h.use_spear()
                         h.trigger_thinking("Combat with a stranger!")
 
-            # Movement Logic (Random but restricted when thinking)
-            if not h.is_thinking and random.random() > 0.6:
-                h.x = max(0, min(MAP_W-1, h.x + random.randint(-1, 1)))
-                h.y = max(0, min(MAP_H-1, h.y + random.randint(-1, 1)))
+            vision = self._vision_range(h)
+            moved = False
+            if h.move_cooldown <= 0:
+                if h.thirst >= 70:
+                    target = self._find_nearest_tile(h, 3, vision)
+                    if target:
+                        self._step_toward(h, target, purposeful=True)
+                        moved = True
+                elif h.hunger >= 70:
+                    target = self._find_nearest_item(h, "🍎", vision)
+                    if target:
+                        self._step_toward(h, target, purposeful=True)
+                        moved = True
+
+                if self.world[h.y][h.x] == 3 and h.thirst < 70:
+                    moved = True
+
+                # Movement Logic (Random but restricted when thinking)
+                if not moved and not h.is_thinking and self.rng.random() > 0.6:
+                    nx = max(0, min(MAP_W-1, h.x + self.rng.randint(-1, 1)))
+                    ny = max(0, min(MAP_H-1, h.y + self.rng.randint(-1, 1)))
+                    if self.world[ny][nx] != 3:
+                        h.x, h.y = nx, ny
+                    elif self.world[ny][nx] == 3 and self.rng.random() > 0.5:
+                        h.x, h.y = nx, ny
+                        h.move_cooldown = max(h.move_cooldown, 0.75)
+
+            if self.world[h.y][h.x] == 3 and h.thirst > 0:
+                h.thirst = 0
+
+        if not self.first_spear_logged and any("SPEAR" in h.tools for h in self.humans):
+            self.first_spear_logged = True
+            self.log_event("The first spear was crafted.")
 
 def main():
     pygame.init()
@@ -253,48 +397,73 @@ def main():
     bold = pygame.font.SysFont("Verdana", 16, bold=True)
 
     while True:
+        dt_seconds = clock.tick(FPS) / 1000.0
         for event in pygame.event.get():
             if event.type == pygame.QUIT: pygame.quit(); sys.exit()
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
-                for h in sim.humans:
-                    if abs(h.x*TILE_SIZE - mx) < TILE_SIZE and abs(h.y*TILE_SIZE - my) < TILE_SIZE:
-                        sim.selected = h
+                if my < MAP_H * TILE_SIZE:
+                    for h in sim.humans:
+                        if abs(h.x*TILE_SIZE - mx) < TILE_SIZE and abs(h.y*TILE_SIZE - my) < TILE_SIZE:
+                            sim.selected = h
             if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
                 sim.selected.trigger_thinking("A god speaks from the clouds.")
 
-        sim.update()
+        sim.update(dt_seconds)
         screen.fill(BLACK)
 
         # 1. Draw Map
         for y in range(MAP_H):
             for x in range(MAP_W): draw_world_tile(screen, x, y, sim.world[y][x])
-        
+
         # 2. Draw Items
         for (x,y), item in sim.items.items():
             ix, iy = x*TILE_SIZE+TILE_SIZE//2, y*TILE_SIZE+TILE_SIZE//2
             color = RED if item == "🍎" else WHITE if item == "🦴" else BROWN
             pygame.draw.circle(screen, color, (ix, iy), 6)
 
-        # 3. Draw Humans
+        # 3. Draw Fires
+        for fx, fy in sim.fires:
+            cx, cy = fx*TILE_SIZE+TILE_SIZE//2, fy*TILE_SIZE+TILE_SIZE//2
+            pygame.draw.circle(screen, (255, 140, 0), (cx, cy-4), 6)
+            pygame.draw.circle(screen, (255, 215, 0), (cx, cy+2), 4)
+
+        # 4. Draw Humans
         for h in sim.humans:
             if not h.alive: continue
             if h == sim.selected:
                 pygame.draw.circle(screen, GOLD, (h.x*TILE_SIZE+TILE_SIZE//2, h.y*TILE_SIZE+TILE_SIZE//2), 22, 2)
             draw_agent(screen, h)
 
-        # 4. Draw Sidebar
+        # Night shading
+        dark_surface = pygame.Surface((MAP_W*TILE_SIZE, MAP_H*TILE_SIZE), pygame.SRCALPHA)
+        alpha = int((1 - sim.light_level) * 180)
+        dark_surface.fill((0, 0, 0, alpha))
+        screen.blit(dark_surface, (0,0))
+
+        if sim.is_raining:
+            rain_surface = pygame.Surface((MAP_W*TILE_SIZE, MAP_H*TILE_SIZE), pygame.SRCALPHA)
+            for rx in range(0, MAP_W*TILE_SIZE, 12):
+                pygame.draw.line(rain_surface, (150, 180, 255, 120), (rx, 0), (rx-8, MAP_H*TILE_SIZE), 2)
+            screen.blit(rain_surface, (0,0))
+
+        # 5. Draw Sidebar
         pygame.draw.rect(screen, (30, 25, 20), (MAP_W*TILE_SIZE, 0, SIDEBAR_W, SCREEN_H))
         sh = sim.selected
-        
+
         # Text Header
         screen.blit(bold.render(f"AGENT: {sh.name}", True, GOLD), (MAP_W*TILE_SIZE+20, 20))
         # Visual Health Bar
         pygame.draw.rect(screen, (100, 0, 0), (MAP_W*TILE_SIZE+20, 50, 200, 10))
-        pygame.draw.rect(screen, RED, (MAP_W*TILE_SIZE+20, 50, sh.hp * 2, 10))
-        
+        pygame.draw.rect(screen, RED, (MAP_W*TILE_SIZE+20, 50, max(0, sh.hp) * 2, 10))
+        # Thirst Bar
+        pygame.draw.rect(screen, (20, 20, 80), (MAP_W*TILE_SIZE+20, 70, 200, 10))
+        pygame.draw.rect(screen, (70, 130, 180), (MAP_W*TILE_SIZE+20, 70, min(100, sh.thirst) * 2, 10))
+
         # Info
         info_list = [
+            f"Temperature: {sim.temperature}C | {'Night' if sim.is_night else 'Day'}",
+            f"Hunger: {int(sh.hunger)}  Thirst: {int(sh.thirst)}",
             f"Inventory: {sh.inventory}",
             f"Tools: {sh.tools}",
             "---",
@@ -307,7 +476,7 @@ def main():
             "---",
             "Press 'T' to interact with selected human."
         ]
-        
+
         y_pos = 100
         for line in info_list:
             if len(line) > 42: line = line[:40] + "..."
@@ -315,8 +484,17 @@ def main():
             screen.blit(font.render(line, True, color), (MAP_W*TILE_SIZE+20, y_pos))
             y_pos += 35
 
+        # 6. World Logger
+        log_rect = (0, MAP_H*TILE_SIZE, SCREEN_W, LOG_HEIGHT)
+        pygame.draw.rect(screen, (15, 12, 10), log_rect)
+        pygame.draw.rect(screen, GOLD, log_rect, 2)
+        screen.blit(bold.render("HISTORICAL EVENTS", True, GOLD), (15, MAP_H*TILE_SIZE + 10))
+        ly = MAP_H*TILE_SIZE + 40
+        for evt in sim.log_events:
+            screen.blit(font.render(evt, True, WHITE), (20, ly))
+            ly += 18
+
         pygame.display.flip()
-        clock.tick(FPS)
 
 if __name__ == "__main__":
     main()
