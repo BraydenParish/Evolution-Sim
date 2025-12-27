@@ -8,8 +8,8 @@ import math
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MODEL_NAME = "qwen2.5:1.5b" 
-TILE_SIZE = 36 
+MODEL_NAME = "qwen2.5:1.5b"
+TILE_SIZE = 36
 MAP_W, MAP_H = 18, 18
 SIDEBAR_W = 360
 SCREEN_W = (MAP_W * TILE_SIZE) + SIDEBAR_W
@@ -132,15 +132,40 @@ class Simulation:
     def __init__(self):
         self.world = [[random.choices([0,1,2,3], weights=[60,15,10,15])[0] for _ in range(MAP_W)] for _ in range(MAP_H)]
         self.items = {}
+        self.huts = {}
         for y in range(MAP_H):
             for x in range(MAP_W):
                 if self.world[y][x] == 1: self.items[(x,y)] = "🍎"
-                elif self.world[y][x] == 2: self.items[(x,y)] = "🦴" 
-                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢" 
+                elif self.world[y][x] == 2: self.items[(x,y)] = "🦴"
+                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢"
         
         self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0) for i in range(3)] + \
                       [Human(i, random.randint(15,17), random.randint(15,17), 1) for i in range(3,6)]
         self.selected = self.humans[0]
+
+    def attempt_build_hut(self, human):
+        """Try to build a hut on the human's tile using one bone and one stick.
+
+        Returns True if a new hut was placed; otherwise False.
+        """
+        if not human.alive:
+            return False
+
+        if not (0 <= human.x < MAP_W and 0 <= human.y < MAP_H):
+            return False
+
+        pos = (human.x, human.y)
+        # Only allow huts on grass tiles and when no hut already exists.
+        if pos in self.huts or self.world[human.y][human.x] != 0:
+            return False
+
+        if "🦴" not in human.inventory or "🥢" not in human.inventory:
+            return False
+
+        human.inventory.remove("🦴")
+        human.inventory.remove("🥢")
+        self.huts[pos] = {"tribe": human.tribe_id, "builder": human.id}
+        return True
 
     def update(self):
         for h in self.humans:
@@ -161,6 +186,10 @@ class Simulation:
             # Trigger Crafting Check
             if "🦴" in h.inventory and "🥢" in h.inventory and "SPEAR" not in h.tools:
                 h.trigger_thinking("I have a stick and a stone. Can I make something?")
+
+            # Attempt to build a hut when calm and stocked.
+            if "🦴" in h.inventory and "🥢" in h.inventory:
+                self.attempt_build_hut(h)
 
             # System 2: Combat
             for other in self.humans:
@@ -206,6 +235,17 @@ def main():
             ix, iy = x*TILE_SIZE+TILE_SIZE//2, y*TILE_SIZE+TILE_SIZE//2
             color = RED if item == "🍎" else WHITE if item == "🦴" else BROWN
             pygame.draw.circle(screen, color, (ix, iy), 6)
+
+        # 2b. Draw Huts
+        for (x, y), hut in sim.huts.items():
+            base_x, base_y = x * TILE_SIZE, y * TILE_SIZE
+            hut_color = (160, 120, 80) if hut["tribe"] == 0 else (100, 80, 160)
+            pygame.draw.rect(screen, hut_color, (base_x + 8, base_y + 8, TILE_SIZE - 16, TILE_SIZE - 10))
+            pygame.draw.polygon(screen, (120, 90, 50), [
+                (base_x + TILE_SIZE//2, base_y + 4),
+                (base_x + 6, base_y + 14),
+                (base_x + TILE_SIZE - 6, base_y + 14)
+            ])
 
         # 3. Draw Humans
         for h in sim.humans:
