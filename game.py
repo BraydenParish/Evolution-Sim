@@ -65,7 +65,7 @@ class QwenBrain:
 # AGENT CLASS
 # ==========================================
 class Human:
-    def __init__(self, id, x, y, tribe_id):
+    def __init__(self, id, x, y, tribe_id, role="Gatherer"):
         self.id = id
         self.tribe_id = tribe_id
         self.name = f"{'Sun' if tribe_id==0 else 'Moon'}_{id}"
@@ -419,10 +419,14 @@ class Simulation:
                 self.items[pos] = "🍎"
                 self.farms[pos] = pygame.time.get_ticks() + 5000
 
-            # System 2: Combat
+            # Discovery & Fog
+            self.reveal_area(h)
+
+            # System 2: Diplomacy & Combat
             for other in self.humans:
                 if other.alive and other.tribe_id != h.tribe_id:
                     if abs(h.x-other.x) < 2 and abs(h.y-other.y) < 2:
+                        self.handle_dialogue(h, other)
                         other.hp -= (h.attack_power / 10)
                         h.use_spear()
                         h.trigger_thinking("Combat with a stranger!")
