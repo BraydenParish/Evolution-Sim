@@ -6,6 +6,8 @@ import threading
 import math
 from collections import deque
 
+from camera import Camera
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
@@ -133,14 +135,14 @@ class Human:
 # ==========================================
 # GRAPHICS DRAWING HELPERS
 # ==========================================
-def draw_agent(surf, h):
-    x, y = h.x * TILE_SIZE, h.y * TILE_SIZE
+def draw_agent(surf, h, camera):
     bob = int(math.sin(pygame.time.get_ticks() * 0.01 + h.anim_timer) * 4)
-    cx, cy = x + TILE_SIZE//2, y + TILE_SIZE//2 + bob
+    cx, cy = camera.world_to_screen(h.x, h.y)
+    cy += bob
     skin = TRIBE_A_SKIN if h.tribe_id == 0 else TRIBE_B_SKIN
-    
+
     # Shadow
-    s_rect = (cx-10, y + TILE_SIZE - 8, 20, 10)
+    s_rect = (cx-10, cy + ISO_TILE_H, 20, 10)
     pygame.draw.ellipse(surf, (0, 0, 0, 60), s_rect)
 
     # Body & Head
@@ -552,6 +554,15 @@ def main():
                             sim.selected = h
             if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
                 sim.selected.trigger_thinking("A god speaks from the clouds.")
+            if event.type == pygame.MOUSEWHEEL:
+                pivot = pygame.mouse.get_pos()
+                factor = 1.1 if event.y > 0 else 0.9
+                sim.camera.zoom_by(factor, pivot=pivot)
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_LEFT]: sim.camera.pan(-10, 0)
+        if keys[pygame.K_RIGHT]: sim.camera.pan(10, 0)
+        if keys[pygame.K_UP]: sim.camera.pan(0, -10)
+        if keys[pygame.K_DOWN]: sim.camera.pan(0, 10)
 
         sim.update(dt_seconds)
         screen.fill(BLACK)
@@ -562,9 +573,9 @@ def main():
 
         # 2. Draw Items
         for (x,y), item in sim.items.items():
-            ix, iy = x*TILE_SIZE+TILE_SIZE//2, y*TILE_SIZE+TILE_SIZE//2
+            ix, iy = sim.camera.world_to_screen(x, y)
             color = RED if item == "🍎" else WHITE if item == "🦴" else BROWN
-            pygame.draw.circle(screen, color, (ix, iy), 6)
+            pygame.draw.circle(screen, color, (ix, iy - ISO_TILE_H / 2), 6)
 
         # 3. Draw Fires
         for fx, fy in sim.fires:
@@ -576,8 +587,9 @@ def main():
         for h in sim.humans:
             if not h.alive: continue
             if h == sim.selected:
-                pygame.draw.circle(screen, GOLD, (h.x*TILE_SIZE+TILE_SIZE//2, h.y*TILE_SIZE+TILE_SIZE//2), 22, 2)
-            draw_agent(screen, h)
+                sx, sy = sim.camera.world_to_screen(h.x, h.y)
+                pygame.draw.circle(screen, GOLD, (int(sx), int(sy)), 22, 2)
+            draw_agent(screen, h, sim.camera)
 
         # Night shading
         dark_surface = pygame.Surface((MAP_W*TILE_SIZE, MAP_H*TILE_SIZE), pygame.SRCALPHA)
