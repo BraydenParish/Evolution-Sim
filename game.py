@@ -4,23 +4,28 @@ import sys
 import requests
 import threading
 import math
+import datetime
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MODEL_NAME = "qwen2.5:1.5b" 
-TILE_SIZE = 36 
+MODEL_NAME = "qwen2.5:1.5b"
+TILE_SIZE = 36
 MAP_W, MAP_H = 18, 18
 SIDEBAR_W = 360
 SCREEN_W = (MAP_W * TILE_SIZE) + SIDEBAR_W
 SCREEN_H = MAP_H * TILE_SIZE
 FPS = 15
+DAY_LENGTH_TICKS = FPS * 20  # ~20 seconds per simulated day
+SEASON_LENGTH_DAYS = 50
 
 # Color Palette
 C_GRASS  = (100, 180, 80)
 C_TREE   = (34, 139, 34)
 C_WATER  = (65, 105, 225)
 C_STONE_G = (120, 120, 120)
+BONE_GRAY = (150, 150, 150)
+ICE_BLUE = (180, 220, 255)
 BROWN    = (100, 60, 30)
 WHITE    = (255, 255, 255)
 BLACK    = (20, 20, 20)
@@ -70,6 +75,11 @@ class Human:
         self.is_thinking = False
         self.anim_timer = random.random() * 10
         self.attack_power = 10
+        self.day_log = []
+        self.phobias = set()
+        self.knowledge = set()
+        self.status_effects = {}
+        self.last_lesson = ""
 
     def trigger_thinking(self, situation):
         if self.is_thinking: return
@@ -84,6 +94,35 @@ class Human:
                     self.attack_power = 40
             self.is_thinking = False
         threading.Thread(target=run_ai, daemon=True).start()
+
+    # ==========================================
+    # MEMORY & DREAMING
+    # ==========================================
+    def log_event(self, event: str):
+        self.day_log.append(event)
+
+    def dream_and_learn(self):
+        if not self.day_log and self.last_lesson:
+            return self.last_lesson
+
+        hazards = {"water": ["water", "river", "lake"], "fire": ["fire", "burn"], "beast": ["wolf", "beast", "bite"]}
+        lesson_bits = []
+        for entry in self.day_log:
+            lower = entry.lower()
+            for phobia, keywords in hazards.items():
+                if any(k in lower for k in keywords):
+                    self.phobias.add(phobia)
+            if "friend" in lower or "tribe" in lower:
+                lesson_bits.append("Protect kin; remember friend")
+            if "bitten" in lower or "wound" in lower:
+                lesson_bits.append("Avoid danger")
+
+        if self.phobias:
+            lesson_bits.append("Fear " + ", ".join(sorted(self.phobias)))
+
+        self.last_lesson = "; ".join(lesson_bits) if lesson_bits else "Rested with no dreams"
+        self.day_log.clear()
+        return self.last_lesson
 
 # ==========================================
 # GRAPHICS DRAWING HELPERS
@@ -113,7 +152,8 @@ def draw_agent(surf, h):
 
 def draw_world_tile(surf, x, y, t_type):
     rect = (x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, TILE_SIZE)
-    base = [C_GRASS, C_TREE, C_STONE_G, C_WATER][t_type]
+    base_palette = [C_GRASS, C_TREE, C_STONE_G, C_WATER, BONE_GRAY, ICE_BLUE]
+    base = base_palette[t_type]
     pygame.draw.rect(surf, base, rect)
     # Detail
     if t_type == 0: # Grass tuft
@@ -124,25 +164,43 @@ def draw_world_tile(surf, x, y, t_type):
     elif t_type == 3: # Shimmering water
         wave = int(math.sin(pygame.time.get_ticks()*0.005 + x)*3)
         pygame.draw.line(surf, WHITE, (x*TILE_SIZE+5, y*TILE_SIZE+15+wave), (x*TILE_SIZE+15, y*TILE_SIZE+15+wave), 1)
+    elif t_type == 4: # Cave entrance
+        pygame.draw.rect(surf, BROWN, (x*TILE_SIZE+8, y*TILE_SIZE+8, TILE_SIZE-16, TILE_SIZE-16))
+        pygame.draw.circle(surf, BLACK, (x*TILE_SIZE+TILE_SIZE//2, y*TILE_SIZE+TILE_SIZE//2), 6)
+    elif t_type == 5: # Snow/ice
+        pygame.draw.rect(surf, ICE_BLUE, rect)
 
 # ==========================================
 # MAIN SIMULATION CLASS
 # ==========================================
 class Simulation:
     def __init__(self):
-        self.world = [[random.choices([0,1,2,3], weights=[60,15,10,15])[0] for _ in range(MAP_W)] for _ in range(MAP_H)]
+        self.world = [[random.choices([0,1,2,3,4], weights=[50,14,8,14,4])[0] for _ in range(MAP_W)] for _ in range(MAP_H)]
         self.items = {}
         for y in range(MAP_H):
             for x in range(MAP_W):
                 if self.world[y][x] == 1: self.items[(x,y)] = "🍎"
-                elif self.world[y][x] == 2: self.items[(x,y)] = "🦴" 
-                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢" 
-        
+                elif self.world[y][x] == 2: self.items[(x,y)] = "🦴"
+                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢"
+                elif self.world[y][x] == 0 and random.random() < 0.05: self.items[(x,y)] = "🌿"  # Bitter herb
+                elif self.world[y][x] == 4 and random.random() < 0.3: self.items[(x,y)] = "🖌️"  # Pigment near caves
+
         self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0) for i in range(3)] + \
                       [Human(i, random.randint(15,17), random.randint(15,17), 1) for i in range(3,6)]
         self.selected = self.humans[0]
+        self.cave_paintings = {}
+        self.tick_count = 0
+        self.day_count = 0
+        self.wolves = [(random.randint(5,12), random.randint(5,12), False)]  # (x,y,is_tame)
+        self.tribal_taboos = {0: set(), 1: set()}
 
     def update(self):
+        self.tick_count += 1
+        if self.tick_count % DAY_LENGTH_TICKS == 0:
+            self.day_count += 1
+            self.process_end_of_day()
+            self.apply_seasonal_changes()
+
         for h in self.humans:
             if not h.alive: continue
             h.hunger += 0.05
@@ -151,9 +209,15 @@ class Simulation:
 
             # System 1: Pickup
             item = self.items.get((h.x, h.y))
-            if item:
+            if item and (h.x, h.y) not in self.tribal_taboos[h.tribe_id]:
                 if item == "🍎": h.hunger = 0
-                else: 
+                elif item == "🌿":
+                    h.inventory.append(item)
+                    h.log_event("Found bitter herb")
+                elif item == "🖌️":
+                    h.inventory.append(item)
+                    h.log_event("Found pigment")
+                else:
                     h.inventory.append(item)
                     h.trigger_thinking(f"I picked up a {item}.")
                 self.items.pop((h.x, h.y))
@@ -167,12 +231,115 @@ class Simulation:
                 if other.alive and other.tribe_id != h.tribe_id:
                     if abs(h.x-other.x) < 2 and abs(h.y-other.y) < 2:
                         other.hp -= (h.attack_power / 10)
+                        if random.random() < 0.2:
+                            other.status_effects["infection"] = other.status_effects.get("infection", 2) + 1
+                            other.log_event("Wounded in combat")
                         h.trigger_thinking("Combat with a stranger!")
 
             # Movement Logic (Random but restricted when thinking)
             if not h.is_thinking and random.random() > 0.6:
                 h.x = max(0, min(MAP_W-1, h.x + random.randint(-1, 1)))
                 h.y = max(0, min(MAP_H-1, h.y + random.randint(-1, 1)))
+
+            self.apply_status_effects(h)
+            self.try_cave_art(h)
+            self.try_domestication(h)
+
+        for idx, (wx, wy, tame) in enumerate(self.wolves):
+            self.wolves[idx] = self.update_wolf(wx, wy, tame)
+
+    # ==========================================
+    # STATUS EFFECTS & MEDICINE
+    # ==========================================
+    def apply_status_effects(self, human: Human):
+        if "infection" in human.status_effects:
+            human.hp -= 0.3
+            human.status_effects["infection"] -= 1
+            if human.status_effects["infection"] <= 0:
+                human.status_effects.pop("infection", None)
+            if "🌿" in human.inventory and human.hp < 80:
+                human.inventory.remove("🌿")
+                human.status_effects.pop("infection", None)
+                human.knowledge.add("medicine")
+                human.hp = min(100, human.hp + 10)
+                human.log_event("Bitter herb eased the wound")
+
+    # ==========================================
+    # CAVE ART & CULTURAL MEMORY
+    # ==========================================
+    def try_cave_art(self, human: Human):
+        if self.world[human.y][human.x] != 4:
+            return None
+        if "🖌️" not in human.inventory or not human.knowledge:
+            return None
+        knowledge = sorted(list(human.knowledge))[0]
+        desc = f"Painting of {human.name} teaching {knowledge}"
+        painting = {"artist": human.name, "knowledge": knowledge, "description": desc, "day": self.day_count}
+        self.cave_paintings[(human.x, human.y)] = painting
+        human.inventory.remove("🖌️")
+        human.log_event(f"Left cave art about {knowledge}")
+        return painting
+
+    def read_cave_art(self, human: Human):
+        painting = self.cave_paintings.get((human.x, human.y))
+        if painting:
+            human.knowledge.add(painting["knowledge"])
+            human.log_event(f"Learned {painting['knowledge']} from cave art")
+
+    # ==========================================
+    # SEASONS & MIGRATION PRESSURE
+    # ==========================================
+    def apply_seasonal_changes(self):
+        season_phase = (self.day_count // SEASON_LENGTH_DAYS) % 2
+        if season_phase == 1:  # Winter
+            for y in range(MAP_H):
+                for x in range(MAP_W):
+                    if self.world[y][x] == 0:
+                        self.world[y][x] = 5  # snow
+                    elif self.world[y][x] == 3:
+                        self.world[y][x] = 5
+        else:
+            for y in range(MAP_H):
+                for x in range(MAP_W):
+                    if self.world[y][x] == 5:
+                        self.world[y][x] = 0
+
+    # ==========================================
+    # DREAMING CYCLE
+    # ==========================================
+    def process_end_of_day(self):
+        for h in self.humans:
+            if not h.alive:
+                continue
+            lesson = h.dream_and_learn()
+            if "lightning" in lesson.lower():
+                taboo = (h.x, h.y)
+                self.tribal_taboos[h.tribe_id].add(taboo)
+
+    # ==========================================
+    # DOMESTICATION
+    # ==========================================
+    def try_domestication(self, human: Human):
+        for idx, (wx, wy, tame) in enumerate(self.wolves):
+            if abs(wx - human.x) <= 1 and abs(wy - human.y) <= 1 and not tame:
+                if "🍎" in human.inventory or "🍖" in human.inventory:
+                    offer = "🍖" if "🍖" in human.inventory else "🍎"
+                    human.inventory.remove(offer)
+                    self.wolves[idx] = (wx, wy, True)
+                    human.knowledge.add("domestication")
+                    human.log_event("Shared food with wolf; it followed")
+
+    def update_wolf(self, x, y, tame):
+        if tame and self.humans:
+            leader = min((h for h in self.humans if h.alive), key=lambda h: abs(h.x - x) + abs(h.y - y), default=None)
+            if leader:
+                dx = 1 if leader.x > x else -1 if leader.x < x else 0
+                dy = 1 if leader.y > y else -1 if leader.y < y else 0
+                return (x + dx, y + dy, True)
+        else:
+            x = max(0, min(MAP_W-1, x + random.randint(-1,1)))
+            y = max(0, min(MAP_H-1, y + random.randint(-1,1)))
+        return (x, y, tame)
 
 def main():
     pygame.init()
