@@ -57,13 +57,14 @@ class QwenBrain:
 # AGENT CLASS
 # ==========================================
 class Human:
-    def __init__(self, id, x, y, tribe_id):
+    def __init__(self, id, x, y, tribe_id, role="Gatherer"):
         self.id = id
         self.tribe_id = tribe_id
         self.name = f"{'Sun' if tribe_id==0 else 'Moon'}_{id}"
         self.x, self.y = x, y
         self.hp, self.hunger = 100, 0
         self.inventory, self.tools = [], []
+        self.role = role
         self.alive = True
         self.thought = "I seek food and the light."
         self.speech = "..."
@@ -138,9 +139,70 @@ class Simulation:
                 elif self.world[y][x] == 2: self.items[(x,y)] = "🦴" 
                 elif self.world[y][x] == 3: self.items[(x,y)] = "🥢" 
         
-        self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0) for i in range(3)] + \
-                      [Human(i, random.randint(15,17), random.randint(15,17), 1) for i in range(3,6)]
+        roles = ["Hunter", "Gatherer", "Builder", "Shaman", "Scout"]
+        self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0, roles[i % len(roles)]) for i in range(3)] + \
+                      [Human(i, random.randint(15,17), random.randint(15,17), 1, roles[i % len(roles)]) for i in range(3,6)]
+        self.dialogues = []
+        self.disaster_log = []
+        self.explored = {0: set(), 1: set()}
         self.selected = self.humans[0]
+
+        for h in self.humans:
+            self.apply_role_effects(h)
+            self.reveal_area(h)
+
+    def reveal_area(self, human):
+        tiles = [(human.x, human.y)]
+        if human.role == "Scout":
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    nx, ny = human.x + dx, human.y + dy
+                    if 0 <= nx < MAP_W and 0 <= ny < MAP_H:
+                        tiles.append((nx, ny))
+        self.explored.setdefault(human.tribe_id, set()).update(tiles)
+
+    def handle_dialogue(self, human_a, human_b):
+        stance = "Dialogue State"
+        proposal = "trade" if ("🍎" in human_a.inventory or "🍎" in human_b.inventory) else "truce"
+        record = {
+            "participants": (human_a.name, human_b.name),
+            "state": stance,
+            "proposal": proposal,
+        }
+        human_a.thought = f"Encountered {human_b.name}: proposing {proposal}."
+        human_b.thought = f"Encountered {human_a.name}: considering {proposal}."
+        human_a.speech = human_a.speech or "..."
+        human_b.speech = human_b.speech or "..."
+        self.dialogues.append(record)
+        return proposal
+
+    def apply_role_effects(self, human):
+        if human.role == "Hunter":
+            human.attack_power = max(human.attack_power, 15)
+        elif human.role == "Gatherer":
+            human.hunger = max(0, human.hunger - 0.5)
+        elif human.role == "Builder":
+            human.hp = min(120, human.hp + 1)
+        elif human.role == "Shaman":
+            if human.hp < 100:
+                human.hp = min(100, human.hp + 0.5)
+        elif human.role == "Scout":
+            # Scouts are slightly faster at hunger recovery when moving
+            human.hunger = max(0, human.hunger - 0.2)
+
+    def apply_disaster(self, kind, severity=10):
+        for h in self.humans:
+            if not h.alive: continue
+            if kind == "lightning":
+                h.hp = max(0, h.hp - severity)
+            elif kind == "flood":
+                h.hp = max(0, h.hp - severity * 0.6)
+                h.hunger += 5
+            elif kind == "drought":
+                h.hunger += severity
+            if h.hp <= 0:
+                h.alive = False
+        self.disaster_log.append({"kind": kind, "severity": severity, "affected": len(self.humans)})
 
     def update(self):
         for h in self.humans:
@@ -162,12 +224,19 @@ class Simulation:
             if "🦴" in h.inventory and "🥢" in h.inventory and "SPEAR" not in h.tools:
                 h.trigger_thinking("I have a stick and a stone. Can I make something?")
 
-            # System 2: Combat
+            # Discovery & Fog
+            self.reveal_area(h)
+
+            # System 2: Diplomacy & Combat
             for other in self.humans:
                 if other.alive and other.tribe_id != h.tribe_id:
                     if abs(h.x-other.x) < 2 and abs(h.y-other.y) < 2:
+                        self.handle_dialogue(h, other)
                         other.hp -= (h.attack_power / 10)
                         h.trigger_thinking("Combat with a stranger!")
+
+            # Role-specific maintenance
+            self.apply_role_effects(h)
 
             # Movement Logic (Random but restricted when thinking)
             if not h.is_thinking and random.random() > 0.6:
