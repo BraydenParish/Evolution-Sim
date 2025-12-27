@@ -5,6 +5,8 @@ import requests
 import threading
 import math
 
+from camera import Camera
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
@@ -12,6 +14,7 @@ MODEL_NAME = "qwen2.5:1.5b"
 TILE_SIZE = 36 
 MAP_W, MAP_H = 18, 18
 SIDEBAR_W = 360
+ISO_TILE_H = TILE_SIZE / 2
 SCREEN_W = (MAP_W * TILE_SIZE) + SIDEBAR_W
 SCREEN_H = MAP_H * TILE_SIZE
 FPS = 15
@@ -88,14 +91,14 @@ class Human:
 # ==========================================
 # GRAPHICS DRAWING HELPERS
 # ==========================================
-def draw_agent(surf, h):
-    x, y = h.x * TILE_SIZE, h.y * TILE_SIZE
+def draw_agent(surf, h, camera):
     bob = int(math.sin(pygame.time.get_ticks() * 0.01 + h.anim_timer) * 4)
-    cx, cy = x + TILE_SIZE//2, y + TILE_SIZE//2 + bob
+    cx, cy = camera.world_to_screen(h.x, h.y)
+    cy += bob
     skin = TRIBE_A_SKIN if h.tribe_id == 0 else TRIBE_B_SKIN
-    
+
     # Shadow
-    s_rect = (cx-10, y + TILE_SIZE - 8, 20, 10)
+    s_rect = (cx-10, cy + ISO_TILE_H, 20, 10)
     pygame.draw.ellipse(surf, (0, 0, 0, 60), s_rect)
 
     # Body & Head
@@ -111,19 +114,27 @@ def draw_agent(surf, h):
     if h.is_thinking:
         pygame.draw.circle(surf, WHITE, (cx + 12, cy - 18), 3)
 
-def draw_world_tile(surf, x, y, t_type):
-    rect = (x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, TILE_SIZE)
+def draw_world_tile(surf, x, y, t_type, camera):
     base = [C_GRASS, C_TREE, C_STONE_G, C_WATER][t_type]
-    pygame.draw.rect(surf, base, rect)
-    # Detail
-    if t_type == 0: # Grass tuft
-        pygame.draw.line(surf, (80, 150, 60), (x*TILE_SIZE+5, y*TILE_SIZE+10), (x*TILE_SIZE+7, y*TILE_SIZE+5), 1)
-    elif t_type == 1: # Bush/Tree
-        pygame.draw.circle(surf, (20, 80, 20), (x*TILE_SIZE+18, y*TILE_SIZE+18), 12)
-        pygame.draw.circle(surf, (40, 100, 40), (x*TILE_SIZE+12, y*TILE_SIZE+12), 10)
-    elif t_type == 3: # Shimmering water
-        wave = int(math.sin(pygame.time.get_ticks()*0.005 + x)*3)
-        pygame.draw.line(surf, WHITE, (x*TILE_SIZE+5, y*TILE_SIZE+15+wave), (x*TILE_SIZE+15, y*TILE_SIZE+15+wave), 1)
+    cx, cy = camera.world_to_screen(x, y)
+    w = camera.tile_width * camera.scale
+    h = camera.tile_height * camera.scale
+    diamond = [
+        (cx, cy - h / 2),
+        (cx + w / 2, cy),
+        (cx, cy + h / 2),
+        (cx - w / 2, cy),
+    ]
+    pygame.draw.polygon(surf, base, diamond)
+
+    if t_type == 0:  # Grass tuft
+        pygame.draw.line(surf, (80, 150, 60), (cx - 4, cy - 2), (cx - 2, cy - 6), 1)
+    elif t_type == 1:  # Bush/Tree
+        pygame.draw.circle(surf, (20, 80, 20), (int(cx), int(cy - h / 4)), 10)
+        pygame.draw.circle(surf, (40, 100, 40), (int(cx - 6), int(cy - h / 5)), 8)
+    elif t_type == 3:  # Shimmering water
+        wave = int(math.sin(pygame.time.get_ticks() * 0.005 + x) * 3)
+        pygame.draw.line(surf, WHITE, (cx - 6, cy + wave), (cx + 6, cy + wave), 1)
 
 # ==========================================
 # MAIN SIMULATION CLASS
@@ -141,6 +152,12 @@ class Simulation:
         self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0) for i in range(3)] + \
                       [Human(i, random.randint(15,17), random.randint(15,17), 1) for i in range(3,6)]
         self.selected = self.humans[0]
+        self.camera = Camera(
+            offset_x=(MAP_W * TILE_SIZE) // 2,
+            offset_y=ISO_TILE_H * 2,
+            tile_width=TILE_SIZE,
+            tile_height=ISO_TILE_H,
+        )
 
     def update(self):
         for h in self.humans:
@@ -188,31 +205,44 @@ def main():
             if event.type == pygame.QUIT: pygame.quit(); sys.exit()
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
-                for h in sim.humans:
-                    if abs(h.x*TILE_SIZE - mx) < TILE_SIZE and abs(h.y*TILE_SIZE - my) < TILE_SIZE:
-                        sim.selected = h
+                if mx < MAP_W * TILE_SIZE:
+                    tx, ty = sim.camera.screen_to_world(mx, my)
+                    for h in sim.humans:
+                        if h.x == tx and h.y == ty:
+                            sim.selected = h
             if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
                 sim.selected.trigger_thinking("A god speaks from the clouds.")
+            if event.type == pygame.MOUSEWHEEL:
+                pivot = pygame.mouse.get_pos()
+                factor = 1.1 if event.y > 0 else 0.9
+                sim.camera.zoom_by(factor, pivot=pivot)
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_LEFT]: sim.camera.pan(-10, 0)
+        if keys[pygame.K_RIGHT]: sim.camera.pan(10, 0)
+        if keys[pygame.K_UP]: sim.camera.pan(0, -10)
+        if keys[pygame.K_DOWN]: sim.camera.pan(0, 10)
 
         sim.update()
         screen.fill(BLACK)
 
         # 1. Draw Map
         for y in range(MAP_H):
-            for x in range(MAP_W): draw_world_tile(screen, x, y, sim.world[y][x])
+            for x in range(MAP_W):
+                draw_world_tile(screen, x, y, sim.world[y][x], sim.camera)
         
         # 2. Draw Items
         for (x,y), item in sim.items.items():
-            ix, iy = x*TILE_SIZE+TILE_SIZE//2, y*TILE_SIZE+TILE_SIZE//2
+            ix, iy = sim.camera.world_to_screen(x, y)
             color = RED if item == "🍎" else WHITE if item == "🦴" else BROWN
-            pygame.draw.circle(screen, color, (ix, iy), 6)
+            pygame.draw.circle(screen, color, (ix, iy - ISO_TILE_H / 2), 6)
 
         # 3. Draw Humans
         for h in sim.humans:
             if not h.alive: continue
             if h == sim.selected:
-                pygame.draw.circle(screen, GOLD, (h.x*TILE_SIZE+TILE_SIZE//2, h.y*TILE_SIZE+TILE_SIZE//2), 22, 2)
-            draw_agent(screen, h)
+                sx, sy = sim.camera.world_to_screen(h.x, h.y)
+                pygame.draw.circle(screen, GOLD, (int(sx), int(sy)), 22, 2)
+            draw_agent(screen, h, sim.camera)
 
         # 4. Draw Sidebar
         pygame.draw.rect(screen, (30, 25, 20), (MAP_W*TILE_SIZE, 0, SIDEBAR_W, SCREEN_H))
