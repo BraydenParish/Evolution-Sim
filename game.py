@@ -4,13 +4,26 @@ import sys
 import requests
 import threading
 import math
+from pathlib import Path
+
+from simulation_core import (
+    BuildingPlanner,
+    ChunkManager,
+    KnowledgeBase,
+    MemoryChronicle,
+    TribeCoordinator,
+    TILE_GRASS,
+    TILE_TREE,
+    TILE_STONE,
+    TILE_WATER,
+)
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 MODEL_NAME = "qwen2.5:1.5b" 
 TILE_SIZE = 36 
-MAP_W, MAP_H = 18, 18
+MAP_W, MAP_H = 18, 18  # viewport size; world is chunk-based and unbounded
 SIDEBAR_W = 360
 SCREEN_W = (MAP_W * TILE_SIZE) + SIDEBAR_W
 SCREEN_H = MAP_H * TILE_SIZE
@@ -70,6 +83,9 @@ class Human:
         self.is_thinking = False
         self.anim_timer = random.random() * 10
         self.attack_power = 10
+        self.is_chief = False
+        self.resources = {"wood": 0, "stone": 0}
+        self.goal = None
 
     def trigger_thinking(self, situation):
         if self.is_thinking: return
@@ -88,8 +104,8 @@ class Human:
 # ==========================================
 # GRAPHICS DRAWING HELPERS
 # ==========================================
-def draw_agent(surf, h):
-    x, y = h.x * TILE_SIZE, h.y * TILE_SIZE
+def draw_agent(surf, h, offset):
+    x, y = (h.x - offset[0]) * TILE_SIZE, (h.y - offset[1]) * TILE_SIZE
     bob = int(math.sin(pygame.time.get_ticks() * 0.01 + h.anim_timer) * 4)
     cx, cy = x + TILE_SIZE//2, y + TILE_SIZE//2 + bob
     skin = TRIBE_A_SKIN if h.tribe_id == 0 else TRIBE_B_SKIN
@@ -130,37 +146,94 @@ def draw_world_tile(surf, x, y, t_type):
 # ==========================================
 class Simulation:
     def __init__(self):
-        self.world = [[random.choices([0,1,2,3], weights=[60,15,10,15])[0] for _ in range(MAP_W)] for _ in range(MAP_H)]
+        self.chunk_manager = ChunkManager()
         self.items = {}
-        for y in range(MAP_H):
-            for x in range(MAP_W):
-                if self.world[y][x] == 1: self.items[(x,y)] = "🍎"
-                elif self.world[y][x] == 2: self.items[(x,y)] = "🦴" 
-                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢" 
-        
+        self.generated_resources = set()
         self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0) for i in range(3)] + \
-                      [Human(i, random.randint(15,17), random.randint(15,17), 1) for i in range(3,6)]
+                      [Human(i, random.randint(10,12), random.randint(10,12), 1) for i in range(3,6)]
         self.selected = self.humans[0]
+        self.tribe_knowledge = {0: KnowledgeBase(), 1: KnowledgeBase()}
+        self.tribe_resources = {0: {"wood": 0, "stone": 0}, 1: {"wood": 0, "stone": 0}}
+        self.buildings = []
+        self.farms = {}
+        self.year = 0
+        self.planner = BuildingPlanner()
+        self.coordinator = TribeCoordinator()
+        chiefs = self.coordinator.designate_chiefs([{"id": h.id, "tribe_id": h.tribe_id} for h in self.humans])
+        for h in self.humans:
+            if chiefs.get(h.tribe_id) == h.id:
+                h.is_chief = True
+        self.chronicle = MemoryChronicle(path=Path("chronicle.json"))
+        for tribe_id, chief_id in chiefs.items():
+            self.coordinator.set_order(tribe_id, chief_id, "Gather wood near camp")
 
     def update(self):
+        self.year += 1 if pygame.time.get_ticks() % 1000 < 15 else 0
         for h in self.humans:
-            if not h.alive: continue
+            if not h.alive:
+                continue
             h.hunger += 0.05
-            if h.hunger > 100: h.hp -= 0.5
-            if h.hp <= 0: h.alive = False
+            if h.hunger > 100:
+                h.hp -= 0.5
+            if h.hp <= 0:
+                h.alive = False
+                continue
+
+            tile = self.chunk_manager.get_tile(h.x, h.y)
+            if (h.x, h.y) not in self.generated_resources:
+                if tile == TILE_TREE:
+                    self.items[(h.x, h.y)] = "🪵"
+                elif tile == TILE_STONE:
+                    self.items[(h.x, h.y)] = "🪨"
+                elif tile == TILE_GRASS and random.random() > 0.8:
+                    self.items[(h.x, h.y)] = "🍎"
+                self.generated_resources.add((h.x, h.y))
 
             # System 1: Pickup
             item = self.items.get((h.x, h.y))
             if item:
-                if item == "🍎": h.hunger = 0
-                else: 
-                    h.inventory.append(item)
-                    h.trigger_thinking(f"I picked up a {item}.")
+                if item == "🍎":
+                    h.hunger = 0
+                    self.chronicle.log_event(self.year, f"{h.name} ate an apple at {h.x},{h.y}")
+                elif item == "🪵":
+                    h.resources["wood"] += 1
+                    self.tribe_resources[h.tribe_id]["wood"] += 1
+                elif item == "🪨":
+                    h.resources["stone"] += 1
+                    self.tribe_resources[h.tribe_id]["stone"] += 1
                 self.items.pop((h.x, h.y))
 
-            # Trigger Crafting Check
-            if "🦴" in h.inventory and "🥢" in h.inventory and "SPEAR" not in h.tools:
-                h.trigger_thinking("I have a stick and a stone. Can I make something?")
+            # Trigger knowledge checks
+            resource_flags = {
+                "stone_tools": h.resources["stone"] >= 1 and "🥢" in h.inventory,
+                "fire": self.tribe_resources[h.tribe_id]["wood"] >= 5,
+                "clothing": self.tribe_resources[h.tribe_id]["wood"] >= 2,
+                "pottery": self.tribe_resources[h.tribe_id]["stone"] >= 3,
+                "agriculture": len(self.farms) > 0,
+            }
+            self.tribe_knowledge[h.tribe_id].evaluate_progress(resource_flags)
+
+            # Construction logic
+            tribe_res = self.tribe_resources[h.tribe_id]
+            if tribe_res["wood"] >= 10 and tribe_res["stone"] >= 5:
+                try:
+                    build = self.planner.choose_build(tribe_res, self.tribe_knowledge[h.tribe_id].tier)
+                    self.buildings.append({"type": build.type, "pos": (h.x, h.y), "tribe": h.tribe_id})
+                    self.chronicle.log_event(self.year, f"Tribe {h.tribe_id} built a {build.type} at {h.x},{h.y}")
+                except ValueError:
+                    pass
+
+            # Agriculture
+            if self.tribe_knowledge[h.tribe_id].tier >= 3 and (h.x, h.y) not in self.farms:
+                if random.random() > 0.95:
+                    self.farms[(h.x, h.y)] = pygame.time.get_ticks() + 5000
+                    self.chronicle.log_event(self.year, f"Farm plot started at {h.x},{h.y}")
+
+            # Farm harvest
+            ready_farms = [pos for pos, t in list(self.farms.items()) if pygame.time.get_ticks() >= t]
+            for pos in ready_farms:
+                self.items[pos] = "🍎"
+                self.farms[pos] = pygame.time.get_ticks() + 5000
 
             # System 2: Combat
             for other in self.humans:
@@ -169,10 +242,22 @@ class Simulation:
                         other.hp -= (h.attack_power / 10)
                         h.trigger_thinking("Combat with a stranger!")
 
-            # Movement Logic (Random but restricted when thinking)
+            # Movement Logic with tribal orders
             if not h.is_thinking and random.random() > 0.6:
-                h.x = max(0, min(MAP_W-1, h.x + random.randint(-1, 1)))
-                h.y = max(0, min(MAP_H-1, h.y + random.randint(-1, 1)))
+                order = self.coordinator.orders.get(h.tribe_id)
+                target = None
+                if order:
+                    chiefs = [c for c in self.humans if c.tribe_id == h.tribe_id and c.is_chief]
+                    target = (chiefs[0].x, chiefs[0].y) if chiefs else None
+                dx = random.randint(-1, 1)
+                dy = random.randint(-1, 1)
+                if target:
+                    dx = (target[0] - h.x)
+                    dy = (target[1] - h.y)
+                    dx = 1 if dx > 0 else -1 if dx < 0 else 0
+                    dy = 1 if dy > 0 else -1 if dy < 0 else 0
+                h.x += dx
+                h.y += dy
 
 def main():
     pygame.init()
@@ -188,8 +273,10 @@ def main():
             if event.type == pygame.QUIT: pygame.quit(); sys.exit()
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
+                offset = (sim.selected.x - MAP_W//2, sim.selected.y - MAP_H//2)
+                wx, wy = mx // TILE_SIZE + offset[0], my // TILE_SIZE + offset[1]
                 for h in sim.humans:
-                    if abs(h.x*TILE_SIZE - mx) < TILE_SIZE and abs(h.y*TILE_SIZE - my) < TILE_SIZE:
+                    if h.x == wx and h.y == wy:
                         sim.selected = h
             if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
                 sim.selected.trigger_thinking("A god speaks from the clouds.")
@@ -197,22 +284,38 @@ def main():
         sim.update()
         screen.fill(BLACK)
 
-        # 1. Draw Map
+        # 1. Draw Map with viewport centered on selected human
+        offset = (sim.selected.x - MAP_W//2, sim.selected.y - MAP_H//2)
         for y in range(MAP_H):
-            for x in range(MAP_W): draw_world_tile(screen, x, y, sim.world[y][x])
-        
+            for x in range(MAP_W):
+                tile = sim.chunk_manager.get_tile(x + offset[0], y + offset[1])
+                draw_world_tile(screen, x, y, tile)
+
         # 2. Draw Items
         for (x,y), item in sim.items.items():
-            ix, iy = x*TILE_SIZE+TILE_SIZE//2, y*TILE_SIZE+TILE_SIZE//2
-            color = RED if item == "🍎" else WHITE if item == "🦴" else BROWN
-            pygame.draw.circle(screen, color, (ix, iy), 6)
+            sx, sy = x - offset[0], y - offset[1]
+            if 0 <= sx < MAP_W and 0 <= sy < MAP_H:
+                ix, iy = sx*TILE_SIZE+TILE_SIZE//2, sy*TILE_SIZE+TILE_SIZE//2
+                color = RED if item == "🍎" else WHITE if item == "🪨" else BROWN
+                pygame.draw.circle(screen, color, (ix, iy), 6)
 
-        # 3. Draw Humans
+        # 3. Draw Buildings/Farms
+        for b in self_sim_buildings := getattr(sim, "buildings", []):
+            sx, sy = b["pos"][0] - offset[0], b["pos"][1] - offset[1]
+            if 0 <= sx < MAP_W and 0 <= sy < MAP_H:
+                pygame.draw.rect(screen, GOLD, (sx*TILE_SIZE+8, sy*TILE_SIZE+8, TILE_SIZE-16, TILE_SIZE-16), 2)
+                screen.blit(font.render(b["type"], True, GOLD), (sx*TILE_SIZE+4, sy*TILE_SIZE+4))
+        for (fx, fy), _ in sim.farms.items():
+            sx, sy = fx - offset[0], fy - offset[1]
+            if 0 <= sx < MAP_W and 0 <= sy < MAP_H:
+                pygame.draw.rect(screen, (120, 80, 40), (sx*TILE_SIZE+10, sy*TILE_SIZE+10, TILE_SIZE-20, TILE_SIZE-20), 1)
+
+        # 4. Draw Humans
         for h in sim.humans:
             if not h.alive: continue
             if h == sim.selected:
-                pygame.draw.circle(screen, GOLD, (h.x*TILE_SIZE+TILE_SIZE//2, h.y*TILE_SIZE+TILE_SIZE//2), 22, 2)
-            draw_agent(screen, h)
+                pygame.draw.circle(screen, GOLD, ((h.x-offset[0])*TILE_SIZE+TILE_SIZE//2, (h.y-offset[1])*TILE_SIZE+TILE_SIZE//2), 22, 2)
+            draw_agent(screen, h, offset)
 
         # 4. Draw Sidebar
         pygame.draw.rect(screen, (30, 25, 20), (MAP_W*TILE_SIZE, 0, SIDEBAR_W, SCREEN_H))
