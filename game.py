@@ -9,7 +9,7 @@ import math
 # CONFIGURATION
 # ==========================================
 MODEL_NAME = "qwen2.5:1.5b" 
-TILE_SIZE = 36 
+TILE_SIZE = 36
 MAP_W, MAP_H = 18, 18
 SIDEBAR_W = 360
 SCREEN_W = (MAP_W * TILE_SIZE) + SIDEBAR_W
@@ -26,6 +26,7 @@ WHITE    = (255, 255, 255)
 BLACK    = (20, 20, 20)
 GOLD     = (255, 215, 0)
 RED      = (220, 20, 60)
+HUT_BROWN = (140, 100, 60)
 TRIBE_A_SKIN = (245, 200, 160)
 TRIBE_B_SKIN = (160, 140, 220)
 
@@ -70,6 +71,21 @@ class Human:
         self.is_thinking = False
         self.anim_timer = random.random() * 10
         self.attack_power = 10
+        self.spear_uses = 0
+
+    def use_spear(self):
+        """Decrement spear durability and convert to a stick when exhausted."""
+        if "SPEAR" not in self.tools:
+            return
+        if not hasattr(self, "spear_uses"):
+            self.spear_uses = 5
+        self.spear_uses -= 1
+        if self.spear_uses <= 0:
+            self.spear_uses = 0
+            if "SPEAR" in self.tools:
+                self.tools.remove("SPEAR")
+            self.inventory.append("🥢")
+            self.attack_power = 10
 
     def trigger_thinking(self, situation):
         if self.is_thinking: return
@@ -82,6 +98,7 @@ class Human:
                     self.inventory.remove("🦴"); self.inventory.remove("🥢")
                     self.tools.append("SPEAR")
                     self.attack_power = 40
+                    self.spear_uses = 5
             self.is_thinking = False
         threading.Thread(target=run_ai, daemon=True).start()
 
@@ -113,7 +130,8 @@ def draw_agent(surf, h):
 
 def draw_world_tile(surf, x, y, t_type):
     rect = (x*TILE_SIZE, y*TILE_SIZE, TILE_SIZE, TILE_SIZE)
-    base = [C_GRASS, C_TREE, C_STONE_G, C_WATER][t_type]
+    base_lookup = [C_GRASS, C_TREE, C_STONE_G, C_WATER, HUT_BROWN]
+    base = base_lookup[t_type]
     pygame.draw.rect(surf, base, rect)
     # Detail
     if t_type == 0: # Grass tuft
@@ -124,6 +142,12 @@ def draw_world_tile(surf, x, y, t_type):
     elif t_type == 3: # Shimmering water
         wave = int(math.sin(pygame.time.get_ticks()*0.005 + x)*3)
         pygame.draw.line(surf, WHITE, (x*TILE_SIZE+5, y*TILE_SIZE+15+wave), (x*TILE_SIZE+15, y*TILE_SIZE+15+wave), 1)
+    elif t_type == 4: # Hut roof line
+        pygame.draw.polygon(surf, (200, 180, 120), [
+            (x*TILE_SIZE+6, y*TILE_SIZE+18),
+            (x*TILE_SIZE+TILE_SIZE//2, y*TILE_SIZE+6),
+            (x*TILE_SIZE+TILE_SIZE-6, y*TILE_SIZE+18)
+        ])
 
 # ==========================================
 # MAIN SIMULATION CLASS
@@ -136,11 +160,23 @@ class Simulation:
             for x in range(MAP_W):
                 if self.world[y][x] == 1: self.items[(x,y)] = "🍎"
                 elif self.world[y][x] == 2: self.items[(x,y)] = "🦴" 
-                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢" 
-        
+                elif self.world[y][x] == 3: self.items[(x,y)] = "🥢"
+
         self.humans = [Human(i, random.randint(0,2), random.randint(0,2), 0) for i in range(3)] + \
                       [Human(i, random.randint(15,17), random.randint(15,17), 1) for i in range(3,6)]
         self.selected = self.humans[0]
+
+    @staticmethod
+    def _apple_capacity(human):
+        return 5 if "Vine Basket" in human.inventory else 1
+
+    def _near_fire(self, x, y):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                pos = (x + dx, y + dy)
+                if pos in self.items and self.items[pos] == "🔥":
+                    return True
+        return False
 
     def update(self):
         for h in self.humans:
@@ -149,14 +185,46 @@ class Simulation:
             if h.hunger > 100: h.hp -= 0.5
             if h.hp <= 0: h.alive = False
 
+            # Discovery of fire while contemplating.
+            if h.is_thinking and h.inventory.count("🦴") >= 2 and random.random() < 0.05:
+                self.items[(h.x, h.y)] = "🔥"
+
+            # System 1: Cook meat if near fire.
+            if "Corpse" in h.inventory and self._near_fire(h.x, h.y):
+                h.inventory.remove("Corpse")
+                h.inventory.append("Cooked Meat")
+                h.hunger = 0
+
             # System 1: Pickup
             item = self.items.get((h.x, h.y))
             if item:
-                if item == "🍎": h.hunger = 0
-                else: 
+                if item == "🍎":
+                    if h.inventory.count("🍎") < self._apple_capacity(h):
+                        h.inventory.append(item)
+                    h.hunger = 0
+                    self.items.pop((h.x, h.y))
+                elif item == "🔥":
+                    # Leave fire in place; do not pick up.
+                    pass
+                else:
                     h.inventory.append(item)
                     h.trigger_thinking(f"I picked up a {item}.")
-                self.items.pop((h.x, h.y))
+                    self.items.pop((h.x, h.y))
+
+            # Hut building using sticks
+            if h.inventory.count("🥢") >= 3 and self.world[h.y][h.x] != 4:
+                for _ in range(3):
+                    h.inventory.remove("🥢")
+                self.world[h.y][h.x] = 4
+
+            # Ranged stone toss
+            for other in self.humans:
+                if other.alive and other.tribe_id != h.tribe_id:
+                    dx, dy = abs(h.x-other.x), abs(h.y-other.y)
+                    if max(dx, dy) == 2 and "🦴" in h.inventory:
+                        h.inventory.remove("🦴")
+                        other.hp -= 5
+                        h.trigger_thinking("I hurled a stone at a foe!")
 
             # Trigger Crafting Check
             if "🦴" in h.inventory and "🥢" in h.inventory and "SPEAR" not in h.tools:
@@ -167,6 +235,7 @@ class Simulation:
                 if other.alive and other.tribe_id != h.tribe_id:
                     if abs(h.x-other.x) < 2 and abs(h.y-other.y) < 2:
                         other.hp -= (h.attack_power / 10)
+                        h.use_spear()
                         h.trigger_thinking("Combat with a stranger!")
 
             # Movement Logic (Random but restricted when thinking)
