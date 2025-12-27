@@ -387,9 +387,37 @@ class Simulation:
             if self.world[h.y][h.x] == 3 and h.thirst > 0:
                 h.thirst = 0
 
-            # Trigger Crafting Check
-            if "🦴" in h.inventory and "🥢" in h.inventory and "SPEAR" not in h.tools:
-                h.trigger_thinking("I have a stick and a stone. Can I make something?")
+            # Trigger knowledge checks
+            resource_flags = {
+                "stone_tools": h.resources["stone"] >= 1 and "🥢" in h.inventory,
+                "fire": self.tribe_resources[h.tribe_id]["wood"] >= 5,
+                "clothing": self.tribe_resources[h.tribe_id]["wood"] >= 2,
+                "pottery": self.tribe_resources[h.tribe_id]["stone"] >= 3,
+                "agriculture": len(self.farms) > 0,
+            }
+            self.tribe_knowledge[h.tribe_id].evaluate_progress(resource_flags)
+
+            # Construction logic
+            tribe_res = self.tribe_resources[h.tribe_id]
+            if tribe_res["wood"] >= 10 and tribe_res["stone"] >= 5:
+                try:
+                    build = self.planner.choose_build(tribe_res, self.tribe_knowledge[h.tribe_id].tier)
+                    self.buildings.append({"type": build.type, "pos": (h.x, h.y), "tribe": h.tribe_id})
+                    self.chronicle.log_event(self.year, f"Tribe {h.tribe_id} built a {build.type} at {h.x},{h.y}")
+                except ValueError:
+                    pass
+
+            # Agriculture
+            if self.tribe_knowledge[h.tribe_id].tier >= 3 and (h.x, h.y) not in self.farms:
+                if random.random() > 0.95:
+                    self.farms[(h.x, h.y)] = pygame.time.get_ticks() + 5000
+                    self.chronicle.log_event(self.year, f"Farm plot started at {h.x},{h.y}")
+
+            # Farm harvest
+            ready_farms = [pos for pos, t in list(self.farms.items()) if pygame.time.get_ticks() >= t]
+            for pos in ready_farms:
+                self.items[pos] = "🍎"
+                self.farms[pos] = pygame.time.get_ticks() + 5000
 
             # System 2: Combat
             for other in self.humans:
@@ -567,7 +595,8 @@ def main():
         sim.update(dt_seconds)
         screen.fill(BLACK)
 
-        # 1. Draw Map
+        # 1. Draw Map with viewport centered on selected human
+        offset = (sim.selected.x - MAP_W//2, sim.selected.y - MAP_H//2)
         for y in range(MAP_H):
             for x in range(MAP_W): draw_world_tile(screen, x, y, sim.world[y][x])
 
