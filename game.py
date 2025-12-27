@@ -1,7 +1,7 @@
-import pygame
+import json
+import math
 import random
 import sys
-import requests
 import threading
 import math
 from collections import deque
@@ -23,6 +23,7 @@ C_GRASS  = (100, 180, 80)
 C_TREE   = (34, 139, 34)
 C_WATER  = (65, 105, 225)
 C_STONE_G = (120, 120, 120)
+C_HUT    = (160, 110, 60)
 BROWN    = (100, 60, 30)
 WHITE    = (255, 255, 255)
 BLACK    = (20, 20, 20)
@@ -68,6 +69,8 @@ class Human:
         self.hp, self.hunger = 100, 0
         self.thirst = 0
         self.inventory, self.tools = [], []
+        self.memories = []
+        self.gender = random.choice(["M", "F"])
         self.alive = True
         self.thought = "I seek food and the light."
         self.speech = "..."
@@ -76,8 +79,9 @@ class Human:
         self.attack_power = 10
         self.move_cooldown = 0.0
 
-    def trigger_thinking(self, situation):
+    def trigger_thinking(self, situation, async_call=True):
         if self.is_thinking: return
+
         def run_ai():
             self.is_thinking = True
             res = QwenBrain.call_brain(self.name, self.inventory, self.tools, situation)
@@ -89,7 +93,11 @@ class Human:
                     self.attack_power = 40
                     self.spear_uses = 5
             self.is_thinking = False
-        threading.Thread(target=run_ai, daemon=True).start()
+
+        if async_call:
+            threading.Thread(target=run_ai, daemon=True).start()
+        else:
+            run_ai()
 
 # ==========================================
 # GRAPHICS DRAWING HELPERS
@@ -128,6 +136,9 @@ def draw_world_tile(surf, x, y, t_type):
     elif t_type == 1: # Bush/Tree
         pygame.draw.circle(surf, (20, 80, 20), (x*TILE_SIZE+18, y*TILE_SIZE+18), 12)
         pygame.draw.circle(surf, (40, 100, 40), (x*TILE_SIZE+12, y*TILE_SIZE+12), 10)
+    elif t_type == 4: # Hut outline
+        pygame.draw.rect(surf, (120, 80, 40), (x*TILE_SIZE+6, y*TILE_SIZE+10, TILE_SIZE-12, TILE_SIZE-12), 2)
+        pygame.draw.rect(surf, (200, 170, 120), (x*TILE_SIZE+10, y*TILE_SIZE+18, TILE_SIZE-20, TILE_SIZE-16))
     elif t_type == 3: # Shimmering water
         wave = int(math.sin(pygame.time.get_ticks()*0.005 + x)*3)
         pygame.draw.line(surf, WHITE, (x*TILE_SIZE+5, y*TILE_SIZE+15+wave), (x*TILE_SIZE+15, y*TILE_SIZE+15+wave), 1)
@@ -159,6 +170,8 @@ class Simulation:
         self.humans = [Human(i, self.rng.randint(0,2), self.rng.randint(0,2), 0) for i in range(3)] + \
                       [Human(i, self.rng.randint(15,17), self.rng.randint(15,17), 1) for i in range(3,6)]
         self.selected = self.humans[0]
+        self.migration_targets = {}
+        self.next_human_id = len(self.humans)
 
         self.fires = {(2, 2), (15, 15)}
         self.log_events = deque(maxlen=8)
