@@ -17,6 +17,8 @@ LOG_HEIGHT = 140
 SCREEN_W = (MAP_W * TILE_SIZE) + SIDEBAR_W
 SCREEN_H = (MAP_H * TILE_SIZE) + LOG_HEIGHT
 FPS = 15
+DAY_LENGTH_TICKS = FPS * 20  # ~20 seconds per simulated day
+SEASON_LENGTH_DAYS = 50
 
 # Color Palette
 C_GRASS  = (100, 180, 80)
@@ -98,6 +100,35 @@ class Human:
             threading.Thread(target=run_ai, daemon=True).start()
         else:
             run_ai()
+
+    # ==========================================
+    # MEMORY & DREAMING
+    # ==========================================
+    def log_event(self, event: str):
+        self.day_log.append(event)
+
+    def dream_and_learn(self):
+        if not self.day_log and self.last_lesson:
+            return self.last_lesson
+
+        hazards = {"water": ["water", "river", "lake"], "fire": ["fire", "burn"], "beast": ["wolf", "beast", "bite"]}
+        lesson_bits = []
+        for entry in self.day_log:
+            lower = entry.lower()
+            for phobia, keywords in hazards.items():
+                if any(k in lower for k in keywords):
+                    self.phobias.add(phobia)
+            if "friend" in lower or "tribe" in lower:
+                lesson_bits.append("Protect kin; remember friend")
+            if "bitten" in lower or "wound" in lower:
+                lesson_bits.append("Avoid danger")
+
+        if self.phobias:
+            lesson_bits.append("Fear " + ", ".join(sorted(self.phobias)))
+
+        self.last_lesson = "; ".join(lesson_bits) if lesson_bits else "Rested with no dreams"
+        self.day_log.clear()
+        return self.last_lesson
 
 # ==========================================
 # GRAPHICS DRAWING HELPERS
@@ -399,6 +430,106 @@ class Simulation:
         if not self.first_spear_logged and any("SPEAR" in h.tools for h in self.humans):
             self.first_spear_logged = True
             self.log_event("The first spear was crafted.")
+
+            self.apply_status_effects(h)
+            self.try_cave_art(h)
+            self.try_domestication(h)
+
+        for idx, (wx, wy, tame) in enumerate(self.wolves):
+            self.wolves[idx] = self.update_wolf(wx, wy, tame)
+
+    # ==========================================
+    # STATUS EFFECTS & MEDICINE
+    # ==========================================
+    def apply_status_effects(self, human: Human):
+        if "infection" in human.status_effects:
+            human.hp -= 0.3
+            human.status_effects["infection"] -= 1
+            if human.status_effects["infection"] <= 0:
+                human.status_effects.pop("infection", None)
+            if "🌿" in human.inventory and human.hp < 80:
+                human.inventory.remove("🌿")
+                human.status_effects.pop("infection", None)
+                human.knowledge.add("medicine")
+                human.hp = min(100, human.hp + 10)
+                human.log_event("Bitter herb eased the wound")
+
+    # ==========================================
+    # CAVE ART & CULTURAL MEMORY
+    # ==========================================
+    def try_cave_art(self, human: Human):
+        if self.world[human.y][human.x] != 4:
+            return None
+        if "🖌️" not in human.inventory or not human.knowledge:
+            return None
+        knowledge = sorted(list(human.knowledge))[0]
+        desc = f"Painting of {human.name} teaching {knowledge}"
+        painting = {"artist": human.name, "knowledge": knowledge, "description": desc, "day": self.day_count}
+        self.cave_paintings[(human.x, human.y)] = painting
+        human.inventory.remove("🖌️")
+        human.log_event(f"Left cave art about {knowledge}")
+        return painting
+
+    def read_cave_art(self, human: Human):
+        painting = self.cave_paintings.get((human.x, human.y))
+        if painting:
+            human.knowledge.add(painting["knowledge"])
+            human.log_event(f"Learned {painting['knowledge']} from cave art")
+
+    # ==========================================
+    # SEASONS & MIGRATION PRESSURE
+    # ==========================================
+    def apply_seasonal_changes(self):
+        season_phase = (self.day_count // SEASON_LENGTH_DAYS) % 2
+        if season_phase == 1:  # Winter
+            for y in range(MAP_H):
+                for x in range(MAP_W):
+                    if self.world[y][x] == 0:
+                        self.world[y][x] = 5  # snow
+                    elif self.world[y][x] == 3:
+                        self.world[y][x] = 5
+        else:
+            for y in range(MAP_H):
+                for x in range(MAP_W):
+                    if self.world[y][x] == 5:
+                        self.world[y][x] = 0
+
+    # ==========================================
+    # DREAMING CYCLE
+    # ==========================================
+    def process_end_of_day(self):
+        for h in self.humans:
+            if not h.alive:
+                continue
+            lesson = h.dream_and_learn()
+            if "lightning" in lesson.lower():
+                taboo = (h.x, h.y)
+                self.tribal_taboos[h.tribe_id].add(taboo)
+
+    # ==========================================
+    # DOMESTICATION
+    # ==========================================
+    def try_domestication(self, human: Human):
+        for idx, (wx, wy, tame) in enumerate(self.wolves):
+            if abs(wx - human.x) <= 1 and abs(wy - human.y) <= 1 and not tame:
+                if "🍎" in human.inventory or "🍖" in human.inventory:
+                    offer = "🍖" if "🍖" in human.inventory else "🍎"
+                    human.inventory.remove(offer)
+                    self.wolves[idx] = (wx, wy, True)
+                    human.knowledge.add("domestication")
+                    human.log_event("Shared food with wolf; it followed")
+
+    def update_wolf(self, x, y, tame):
+        if tame and self.humans:
+            leader = min((h for h in self.humans if h.alive), key=lambda h: abs(h.x - x) + abs(h.y - y), default=None)
+            if leader:
+                dx = 1 if leader.x > x else -1 if leader.x < x else 0
+                dy = 1 if leader.y > y else -1 if leader.y < y else 0
+                return (x + dx, y + dy, True)
+        else:
+            x = max(0, min(MAP_W-1, x + random.randint(-1,1)))
+            y = max(0, min(MAP_H-1, y + random.randint(-1,1)))
+        return (x, y, tame)
 
 def main():
     pygame.init()
